@@ -1,133 +1,58 @@
 #include <windows.h>
 #include <tlhelp32.h>
-#include <iostream>
 #include <vector>
+#include <string>
 #include <sstream>
-
-DWORD GetProcessIdByName(const std::wstring& name) {
-    PROCESSENTRY32 entry = { sizeof(PROCESSENTRY32) };
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    DWORD pid = 0;
-
-    if (Process32First(snapshot, &entry)) {
-        do {
-            if (name == entry.szExeFile) {
-                pid = entry.th32ProcessID;
-                break;
-            }
-        } while (Process32Next(snapshot, &entry));
-    }
-
-    CloseHandle(snapshot);
-    return pid;
-}
-
-std::vector<int> ParsePattern(const std::string& patternStr) {
-    std::vector<int> pattern;
-    std::istringstream iss(patternStr);
-    std::string byteStr;
-
-    while (iss >> byteStr) {
-        if (byteStr == "?" || byteStr == "??") {
-            pattern.push_back(-1); // wildcard
-        }
-        else {
-            pattern.push_back(std::stoi(byteStr, nullptr, 16));
-        }
-    }
-
-    return pattern;
-}
-
-bool ComparePattern(const BYTE* data, const std::vector<int>& pattern) {
-    for (size_t i = 0; i < pattern.size(); ++i) {
-        if (pattern[i] != -1 && data[i] != (BYTE)pattern[i])
-            return false;
-    }
-    return true;
-}
-
-uintptr_t FindPattern(HANDLE hProcess, BYTE* base, SIZE_T size, const std::vector<int>& pattern) {
-    std::vector<BYTE> buffer(size);
-    SIZE_T bytesRead;
-
-    if (!ReadProcessMemory(hProcess, base, buffer.data(), size, &bytesRead))
-        return 0;
-
-    for (SIZE_T i = 0; i < bytesRead - pattern.size(); ++i) {
-        if (ComparePattern(&buffer[i], pattern)) {
-            return (uintptr_t)base + i;
-        }
-    }
-    return 0;
-}
+#include <iostream>
 
 int main() {
-    const std::wstring targetProcess = L"CoDWaW.exe";
-    std::string targetProcessStr(targetProcess.begin(), targetProcess.end());
-    const std::string patternStr = "8B 55 ? 83 FA 01";
-    const BYTE patchBytes[] = { 0xE9, 0xEA, 0x00, 0x00, 0x00 };
+    DWORD pid = 0;
+    PROCESSENTRY32 pe{ sizeof(pe) };
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    for (Process32First(snap, &pe); Process32Next(snap, &pe); )
+        if (!wcscmp(pe.szExeFile, L"CoDWaW.exe")) { pid = pe.th32ProcessID; break; }
+    CloseHandle(snap);
+    if (!pid) { std::cerr << "Process not found.\n"; std::cin.get(); return 1; }
 
-    std::vector<int> pattern = ParsePattern(patternStr);
+    HANDLE h = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);
+    if (!h) { std::cerr << "Failed to open process.\n"; std::cin.get(); return 1; }
 
-    DWORD pid = GetProcessIdByName(targetProcess);
-    if (!pid) {
-        std::cout << "Process (" << targetProcessStr << ") not found.\n";
-        system("pause");
-        return 1;
-    }
+    std::vector<int> pat;
+    std::istringstream ss("8B 55 ? 83 FA 01");
+    for (std::string b; ss >> b;)
+        pat.push_back(b == "?" ? -1 : std::stoi(b, nullptr, 16));
 
-    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-    if (!hProcess) {
-        std::cout << "Failed to open process (" << targetProcessStr << ")\n";
-        system("pause");
-        return 1;
-    }
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    MEMORY_BASIC_INFORMATION m; uintptr_t a = (uintptr_t)si.lpMinimumApplicationAddress, f = 0;
+    std::vector<BYTE> buf;
 
-    SYSTEM_INFO sysInfo;
-    GetSystemInfo(&sysInfo);
-    uintptr_t addr = (uintptr_t)sysInfo.lpMinimumApplicationAddress;
-    uintptr_t maxAddr = (uintptr_t)sysInfo.lpMaximumApplicationAddress;
+    for (; a < (uintptr_t)si.lpMaximumApplicationAddress; a += m.RegionSize) {
+        if (!VirtualQueryEx(h, (LPCVOID)a, &m, sizeof(m))) break;
+        if (!(m.State & MEM_COMMIT)) continue;
+        if (!(m.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_READWRITE | PAGE_READONLY))) continue;
 
-    MEMORY_BASIC_INFORMATION mbi;
-    uintptr_t foundAddr = 0;
+        buf.resize(m.RegionSize); SIZE_T r;
+        if (!ReadProcessMemory(h, m.BaseAddress, buf.data(), m.RegionSize, &r)) continue;
 
-    while (addr < maxAddr) {
-        if (VirtualQueryEx(hProcess, (LPCVOID)addr, &mbi, sizeof(mbi))) {
-            bool isReadable = (mbi.Protect & PAGE_EXECUTE_READ) ||
-                (mbi.Protect & PAGE_EXECUTE_READWRITE) ||
-                (mbi.Protect & PAGE_READWRITE) ||
-                (mbi.Protect & PAGE_READONLY);
-
-            if (mbi.State == MEM_COMMIT && isReadable) {
-                foundAddr = FindPattern(hProcess, (BYTE*)mbi.BaseAddress, mbi.RegionSize, pattern);
-                if (foundAddr)
-                    break;
-            }
-            addr += mbi.RegionSize;
+        for (SIZE_T i = 0; i <= r - pat.size(); ++i) {
+            bool match = true;
+            for (SIZE_T j = 0; j < pat.size(); ++j)
+                if (pat[j] != -1 && buf[i + j] != pat[j]) { match = false; break; }
+            if (match) { f = a + i; break; }
         }
-        else {
-            break;
-        }
+        if (f) break;
     }
 
-    if (foundAddr) {
-        std::cout << "Pattern found at: 0x" << std::hex << foundAddr << "\n";
-        SIZE_T written;
-        if (WriteProcessMemory(hProcess, (LPVOID)foundAddr, patchBytes, sizeof(patchBytes), &written)) {
-            std::cout << "Patch applied successfully. In the console set 'cg_fov 90' now!\n";
-            system("pause");
-        }
-        else {
-            std::cout << "Failed to write to memory.\n";
-            system("pause");
-        }
-    }
-    else {
-        std::cout << "Pattern not found.\n";
-        system("pause");
+    if (!f) { std::cerr << "Pattern not found.\n"; std::cin.get(); return 1; }
+
+    BYTE patch[] = { 0xE9, 0xEA, 0x00, 0x00, 0x00 };
+    SIZE_T w;
+    if (!WriteProcessMemory(h, (LPVOID)f, patch, sizeof(patch), &w)) {
+        std::cerr << "Patch failed.\n"; std::cin.get(); return 1;
     }
 
-    CloseHandle(hProcess);
+    std::cout << "Patched!\nSet cg_fov 90 in console now!\nPress enter to close window...";
+    CloseHandle(h);
+    std::cin.get();
     return 0;
 }
